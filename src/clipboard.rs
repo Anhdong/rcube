@@ -6,7 +6,13 @@
 //! understand - this also makes it work over SSH.
 
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
+/// How long we wait for a clipboard helper before assuming it is serving the
+/// selection in the foreground (and carrying on without blocking the UI).
+const HELPER_WAIT: Duration = Duration::from_millis(400);
 
 pub fn copy(text: &str) -> Result<&'static str, String> {
     let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
@@ -42,13 +48,28 @@ fn pipe_to(cmd: &str, args: &[&str], text: &str) -> bool {
     };
     if let Some(mut stdin) = child.stdin.take() {
         if stdin.write_all(text.as_bytes()).is_err() {
+            let _ = child.wait();
             return false;
         }
         // stdin dropped here -> EOF
     }
-    // The tools fork into the background to serve the selection, so the
-    // foreground process exits quickly.
-    child.wait().map(|s| s.success()).unwrap_or(false)
+    wait_briefly(&mut child)
+}
+
+/// The tools normally fork into the background to serve the selection, so the
+/// foreground process exits quickly. If one stays in the foreground instead,
+/// waiting for it would freeze the whole timer, so give up waiting after a
+/// short time and assume it is doing its job.
+fn wait_briefly(child: &mut Child) -> bool {
+    let deadline = Instant::now() + HELPER_WAIT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
+            Ok(None) => return true,
+            Err(_) => return false,
+        }
+    }
 }
 
 fn osc52(text: &str) -> std::io::Result<()> {
@@ -74,7 +95,7 @@ fn base64(data: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::base64;
+    use super::*;
 
     #[test]
     fn base64_vectors() {
@@ -83,5 +104,20 @@ mod tests {
         assert_eq!(base64(b"Ma"), "TWE=");
         assert_eq!(base64(b"Man"), "TWFu");
         assert_eq!(base64(b"R U R' U'"), "UiBVIFInIFUn");
+    }
+
+    #[test]
+    fn slow_helper_does_not_block_forever() {
+        // `sleep` ignores stdin and stays in the foreground.
+        let mut child = Command::new("sleep")
+            .arg("5")
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap();
+        let t = Instant::now();
+        assert!(wait_briefly(&mut child));
+        assert!(t.elapsed() < Duration::from_secs(2));
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }

@@ -35,15 +35,8 @@ OPTIONS:
     -h, --help           Show this help
 
 KEYS:
+    ?                press inside rcube for the full list of key bindings
     space            inspect -> hold (green) -> release to start -> space to stop
-    h j k l / arrows move between results
-    g / G            first / last result
-    2                toggle +2 on the selected result
-    d                toggle DNF
-    Delete (or x)    delete the selected result      u = undo delete
-    r                new scramble
-    y                copy scramble (Y: copy the selected result's scramble)
-    Esc              cancel inspection / discard running solve
     q or Ctrl-C      quit
 
 DATA:
@@ -86,17 +79,21 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut terminal = ratatui::init();
 
     // Ask the terminal to report key *releases* (kitty keyboard protocol) so
-    // "hold space, release to start" works. Not available everywhere.
-    let enhanced = !opts.tap && supports_keyboard_enhancement().unwrap_or(false);
-    if enhanced {
-        execute!(
+    // "hold space, release to start" works. Not available everywhere. If
+    // anything about this fails we simply stay in tap mode (and never bail out
+    // with `?` here: the terminal is already in raw mode and must be restored).
+    let enhanced = !opts.tap
+        && supports_keyboard_enhancement().unwrap_or(false)
+        && execute!(
             stdout(),
             PushKeyboardEnhancementFlags(
                 KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                     | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
                     | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
             )
-        )?;
+        )
+        .is_ok();
+    if enhanced {
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             let _ = execute!(stdout(), PopKeyboardEnhancementFlags);

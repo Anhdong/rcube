@@ -9,7 +9,8 @@
 //!                         preserved untouched when saving
 //!  * stable unique `id` -> backups from several machines can be merged
 //!  * raw `time_ms` + separate `penalty` -> toggling +2 / DNF is lossless
-//!  * atomic writes (tmp file + fsync + rename) -> a crash can't corrupt it
+//!  * atomic writes (tmp file + fsync + rename + directory fsync) -> a crash
+//!    can't corrupt it
 //!  * a `.bak` copy of the previous file is made on every start
 
 use rand::Rng;
@@ -17,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const EVENT_333: &str = "333";
@@ -157,13 +158,34 @@ impl Store {
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
         let tmp = path.with_extension("json.tmp");
-        {
+        let result = (|| {
             let mut f = File::create(&tmp)?;
             f.write_all(json.as_bytes())?;
             f.write_all(b"\n")?;
             f.sync_all()?;
+            drop(f);
+            fs::rename(&tmp, path)
+        })();
+        match result {
+            Ok(()) => {
+                sync_dir(path);
+                Ok(())
+            }
+            Err(e) => {
+                // Don't leave a half-written temp file behind.
+                let _ = fs::remove_file(&tmp);
+                Err(e)
+            }
         }
-        fs::rename(&tmp, path)
+    }
+}
+
+/// Best effort: make the rename itself durable. Failure is not an error.
+fn sync_dir(path: &Path) {
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        if let Ok(d) = File::open(dir) {
+            let _ = d.sync_all();
+        }
     }
 }
 
@@ -201,6 +223,7 @@ mod tests {
         assert_eq!(mine, vec![a.clone()]);
         assert_eq!(reopened.foreign, vec![other]);
         assert!(path.with_extension("json.bak").exists());
+        assert!(!path.with_extension("json.tmp").exists());
 
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains("\"penalty\": \"plus2\""));

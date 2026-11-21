@@ -9,7 +9,9 @@ with [ratatui](https://ratatui.rs) and crossterm.
 - WCA-style 15 s inspection with automatic +2 (after 15 s) and DNF (after 17 s)
 - Time hidden while solving and replaced by a white `SOLVING`
 - Result list with an ao5 next to every result, plus ao12, ao100, mean and bests
-- Scramble cube net (U / L F R B / D) drawn from the current scramble
+- Scramble centred above the timer; compact cube net (U / L F R B / D) in the bottom-right corner
+- Results panel (bottom-left) sized for the last 5 solves; the selection scrolls through older ones
+- Clean screen: all key bindings live in a help window, opened with `?`
 - Vim-style navigation and editing of results
 - Single-file JSON storage that is easy to back up
 - Works over SSH; clipboard copy via `wl-copy`, `xclip`, `xsel` or OSC 52
@@ -35,6 +37,10 @@ Dependencies: `ratatui`, `rand`, `serde`, `serde_json`.
 
 ## Keys
 
+Press **`?`** (or `F1`) inside rcube to see the key bindings; `?`, `F1`, `Esc`
+or `q` closes the window again, `j` / `k` scroll it on small terminals. The
+help is available when no solve is in progress.
+
 | Key                       | Action                                                          |
 |---------------------------|-----------------------------------------------------------------|
 | `space`                   | inspect, hold (turns green), release to start, `space` to stop  |
@@ -46,8 +52,12 @@ Dependencies: `ratatui`, `rand`, `serde`, `serde_json`.
 | `u`                       | undo the last delete                                            |
 | `r`                       | new scramble                                                    |
 | `y` / `Y`                 | copy the scramble / copy the selected result's scramble         |
+| `?` / `F1`                | show / hide the help window                                     |
 | `Esc`                     | cancel inspection, or discard a running solve                   |
 | `q`, `Ctrl-C`             | quit                                                            |
+
+Ctrl/Alt combinations are never treated as commands (so `Ctrl-X` can not delete
+a solve); only `Ctrl-C` is special.
 
 ## Timer colours
 
@@ -65,6 +75,55 @@ recent Alacritty, and WezTerm with `enable_kitty_keyboard = true`). If the
 terminal does not support it (for example GNOME Terminal), rcube switches to
 **tap mode** automatically and shows `[tap mode]` in the footer:
 `space` = inspect, `space` = start, `space` = stop. Use `--tap` to force it.
+
+In hold mode, the first `space` starts the inspection. To start the solve, press
+and **hold** `space` until the timer turns green (0.3 s), then release. Letting
+go too early returns to the inspection and shows a hint.
+
+The timer cannot get stuck when the terminal's key releases don't match the
+physical key:
+
+- If a release arrives practically together with its press (under 15 ms, which
+  no finger can do), the terminal or multiplexer is fabricating releases. rcube
+  switches to tap mode immediately.
+- If you let go before the timer is green twice in a row, holding evidently
+  isn't being detected, and rcube switches to tap mode too. The first early
+  release shows how long the key was actually down ("released after 4 ms: ...").
+
+- If the terminal claims key-release support but never delivers a release, rcube
+  notices on the second press and falls back to tap mode on the fly.
+- If a single release is lost on a terminal that normally sends them (for
+  example because the window lost focus mid-press), the next `space` press acts
+  as that release. `Esc` always cancels.
+
+In tap mode a held key (auto-repeat) is told apart from deliberate taps: events
+within 0.8 s of the last accepted press, and events that follow each other
+within 0.12 s, are ignored. Repeatedly tapping `space` is never swallowed
+forever; the first tap after 0.8 s is accepted.
+
+## Layout
+
+```
+                       scramble moves (centred)
+
+                            big timer
+
+ .- results (n) ---.     badge                     .- scramble -.
+ | #   time    ao5 |     ao5 / ao12 / ao100 / mean |  cube net   |
+ | 8  10.21   9.86 |     best / best ao5           |  (compact)  |
+ | ...  5 rows     |     selected solve + scramble |             |
+ '- 12/12 ---------'                               '-------------'
+ ? help
+```
+
+The two bottom panels always have the same height: borders, the header, and
+five solves. Move the selection (`k`/`j`, `g`/`G`, arrows) to scroll the list;
+the bottom border shows the position (`4/12`) once there are more than five
+solves.
+
+The results panel needs 75 columns, the cube net 104 (the statistics line in
+the middle needs the room). When the window is short, the bottom row shrinks
+first, keeping the timer at least 7 rows tall.
 
 ## Data storage
 
@@ -94,8 +153,9 @@ All solves live in one human-readable file:
 - `event` allows other puzzles to share the file later. Solves of events this
   version does not know are preserved untouched.
 - `id` is unique and time-sortable, so files from two machines can be merged.
-- Writes are atomic (temp file, fsync, rename), and the previous file is copied
-  to `solves.json.bak` on every start.
+- Writes are atomic (temp file, fsync, rename, directory fsync), a failed write
+  leaves no stray temp file, and the previous file is copied to
+  `solves.json.bak` on every start.
 - A corrupt or unsupported file is never overwritten: rcube refuses to
   start and explains why.
 
@@ -103,8 +163,8 @@ All solves live in one human-readable file:
 
 ```
 src/main.rs       terminal setup, event loop, command-line options
-src/app.rs        state machine (idle / inspect / hold / run) and key handling
-src/ui.rs         rendering
+src/app.rs        state machine (idle / inspect / hold / run), key handling, help state
+src/ui.rs         rendering: results, timer, scramble panel, help window
 src/big.rs        big block-letter font (three sizes, chosen to fit the window)
 src/cube.rs       sticker-level cube model used for the scramble preview
 src/scramble.rs   random-move scramble generator (20 moves, no redundant turns)
@@ -115,17 +175,22 @@ src/clipboard.rs  clipboard helpers
 
 ## Testing
 
-`cargo test` runs 29 unit tests covering cube moves and net orientation,
+`cargo test` runs 53 unit tests covering cube moves and net orientation,
 scramble rules, averages with DNF and +2, the timer state machine in both hold
-and tap mode, storage round-trips, and rendering at many terminal sizes.
+and tap mode (including auto-repeat, lost key releases and terminals that never
+send releases), the help window, storage round-trips, and rendering at many
+terminal sizes (panel geometry, the 5-solve results window and its scrolling, centred scramble text, the compact cube net, the help window, no panics).
 
 The release binary was also driven through a pseudo-terminal, once as a legacy
-terminal (tap mode) and once emulating a kitty-protocol terminal (hold mode).
+terminal (tap mode) and once emulating a kitty-protocol terminal (hold mode),
+including terminals that announce key-release support but never send
+releases, or fabricate one right after every press.
 Clipboard integration and real-terminal appearance have not been tested.
 
 ## Limitations and ideas
 
 - 3x3 only for now; the `event` field in the data file is the hook for other puzzles.
 - All solves share one list (no sessions yet).
-- The left panel is hidden below 75 columns, and the cube net is hidden when the
-  terminal is shorter than about 20 rows.
+- The results panel is hidden below 75 columns, the cube net below 104.
+- Two rcube instances sharing one solves file overwrite each other's changes
+  (last writer wins); run only one at a time per file.

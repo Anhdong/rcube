@@ -75,16 +75,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rcube"
-version = "0.1.0"
-dependencies = [
- "rand",
- "ratatui",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "darling"
 version = "0.24.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -376,6 +366,16 @@ dependencies = [
  "unicode-segmentation",
  "unicode-truncate",
  "unicode-width 0.2.0",
+]
+
+[[package]]
+name = "rcube"
+version = "0.1.0"
+dependencies = [
+ "rand",
+ "ratatui",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
