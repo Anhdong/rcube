@@ -284,13 +284,15 @@ fn timer_face(app: &App, now: Instant) -> (String, Color) {
         },
         Phase::Inspecting { start } => (countdown(start), RED),
         Phase::Holding { since, inspect_start } => {
-            if now.saturating_duration_since(since) >= HOLD_TO_READY {
-                ("0.00".into(), GREEN)
+            // Ready (held long enough): same text as before, but green.
+            let color = if now.saturating_duration_since(since) >= HOLD_TO_READY {
+                GREEN
             } else {
-                match inspect_start {
-                    Some(start) => (countdown(start), RED),
-                    None => ("0.00".into(), RED),
-                }
+                RED
+            };
+            match inspect_start {
+                Some(start) => (countdown(start), color),
+                None => ("0.00".into(), color),
             }
         }
         Phase::Running { .. } => ("SOLVING".into(), WHITE),
@@ -486,6 +488,7 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
     v.push(Line::raw(""));
     v.push(heading("General"));
     v.push(row("? / F1", "show / hide this help"));
+    v.push(row("t", "switch between hold and tap mode"));
     v.push(row("q", "quit (Ctrl-C works anywhere)"));
 
     v.push(Line::raw(""));
@@ -503,9 +506,11 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
     v.push(Line::raw(""));
     v.push(Line::styled(
         if app.hold_mode {
-            " hold mode: key releases are reported"
+            " hold mode: key releases are reported (t = tap mode)"
+        } else if app.can_hold {
+            " tap mode: space starts and stops (t = hold mode)"
         } else {
-            " tap mode: this terminal sends no key releases (--tap forces it)"
+            " tap mode: this terminal sends no key releases"
         },
         dim,
     ));
@@ -632,7 +637,15 @@ mod tests {
         }
         app.show_help = true;
         let help = screen(&app, 120, 40);
-        for shown in ["Timer", "Results", "Scramble", "toggle DNF", "undo the last delete", "quit"] {
+        for shown in [
+            "Timer",
+            "Results",
+            "Scramble",
+            "toggle DNF",
+            "undo the last delete",
+            "hold and tap mode",
+            "quit",
+        ] {
             assert!(help.contains(shown), "{shown:?} missing from help");
         }
     }
@@ -766,7 +779,11 @@ mod tests {
 
         app.phase = Phase::Holding { since: t0, inspect_start: Some(t0) };
         assert_eq!(timer_face(&app, t0 + std::time::Duration::from_millis(100)).1, RED);
-        assert_eq!(timer_face(&app, t0 + std::time::Duration::from_millis(400)).1, GREEN);
+        // ready: still the inspection countdown, now green
+        assert_eq!(
+            timer_face(&app, t0 + std::time::Duration::from_millis(400)),
+            ("15".to_string(), GREEN)
+        );
 
         app.phase = Phase::Running { start: t0, penalty: Penalty::None };
         assert_eq!(timer_face(&app, t0), ("SOLVING".to_string(), WHITE));

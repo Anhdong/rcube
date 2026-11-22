@@ -14,22 +14,26 @@ pub const HOLD_TO_READY: Duration = Duration::from_millis(300);
 pub const INSPECTION: Duration = Duration::from_secs(15);
 /// Starting after 15s costs +2, after 17s the solve is a DNF (WCA rules).
 pub const INSPECTION_DNF: Duration = Duration::from_secs(17);
-/// Tap mode: after a space press has been acted on, ignore further space
-/// events for this long. Covers the initial auto-repeat delay of a held key
-/// (typically 250-660 ms).
-const TAP_DEBOUNCE: Duration = Duration::from_millis(800);
+/// Tap mode: minimum time between two accepted presses, by what the press
+/// would do. Stopping must be fast (sub-second solves); starting after the
+/// inspection guards against the first auto-repeat of a held key (it arrives
+/// 250-660 ms after the press) being taken for a second tap.
+const TAP_GAP_STOP: Duration = Duration::from_millis(150);
+const TAP_GAP_START: Duration = Duration::from_millis(700);
 /// Tap mode: space events closer together than this are an auto-repeat stream
 /// (repeat rates are ~30 ms), never two deliberate taps.
 const REPEAT_GAP: Duration = Duration::from_millis(120);
-/// A release this soon after its press cannot come from a human finger (even
-/// the fastest tap lasts several tens of ms). Some terminals and multiplexers
-/// fabricate a release right after every press; holding can never work there.
-const SYNTHETIC_RELEASE: Duration = Duration::from_millis(15);
-/// Letting go before the timer is green this many times in a row (within
-/// `EARLY_RELEASE_WINDOW`) means holding is not working: use tap mode.
-const EARLY_RELEASES_BEFORE_TAP: u8 = 2;
-const EARLY_RELEASE_WINDOW: Duration = Duration::from_secs(20);
-const COOLDOWN: Duration = Duration::from_millis(300);
+/// Hold mode: a press while space is already down, less than this after the
+/// previous space event, is an auto-repeat that the terminal reported as a
+/// press, not a new press.
+const HOLD_REPEAT_GAP: Duration = Duration::from_millis(900);
+/// Hold mode: a release is held back this long. Many systems (X11, some
+/// terminals) report the auto-repeat of a held key as "release + press" pairs
+/// (every ~25 ms). A press that follows a release within this time cancels it,
+/// so a held key stays held. Real releases are still timestamped exactly.
+const RELEASE_GRACE: Duration = Duration::from_millis(40);
+/// Ignore space for this long after a solve ends (Idle only).
+const COOLDOWN: Duration = Duration::from_millis(150);
 const TOAST_TIME: Duration = Duration::from_millis(2500);
 const SCRAMBLE_LEN: usize = 20;
 /// Upper bound for the help window's scroll offset (the renderer clamps it to
@@ -60,6 +64,8 @@ pub struct App {
     /// True when the terminal reports key releases (kitty keyboard protocol):
     /// hold space -> green -> release to start. Otherwise "tap mode".
     pub hold_mode: bool,
+    /// The terminal can report key releases, so `t` may switch to hold mode.
+    pub can_hold: bool,
     pub inspection: bool,
     pub should_quit: bool,
     /// Key-binding help window (`?`).
@@ -69,7 +75,8 @@ pub struct App {
     pub help_scroll: Cell<u16>,
 
     // --- space-bar bookkeeping -------------------------------------------
-    /// Last space event of any kind (tap mode: detects auto-repeat streams).
+    /// Last space press event (hold mode: repeat detection; tap mode: detects
+    /// auto-repeat streams).
     last_space_event: Option<Instant>,
     /// Last space press that was acted on (tap mode: debounce reference).
     last_space_accept: Option<Instant>,
@@ -78,11 +85,9 @@ pub struct App {
     /// Hold mode: at least one space release has ever been delivered, i.e. the
     /// terminal really does report releases.
     releases_seen: bool,
-    /// Hold mode: when the current/last space press arrived.
-    last_space_press: Option<Instant>,
-    /// Hold mode: consecutive releases before the timer turned green.
-    early_releases: u8,
-    last_early_release: Option<Instant>,
+    /// Hold mode: a release that is waiting to see whether a press follows
+    /// immediately (an auto-repeat pair). Holds the real release time.
+    pending_release: Option<Instant>,
     cooldown_until: Option<Instant>,
 }
 
@@ -123,6 +128,7 @@ impl App {
             toast: None,
             deleted: Vec::new(),
             hold_mode,
+            can_hold: hold_mode,
             inspection,
             should_quit: false,
             show_help: false,
@@ -131,9 +137,7 @@ impl App {
             last_space_accept: None,
             space_is_down: false,
             releases_seen: false,
-            last_space_press: None,
-            early_releases: 0,
-            last_early_release: None,
+            pending_release: None,
             cooldown_until: None,
         };
         app.new_scramble();
@@ -158,14 +162,20 @@ impl App {
     }
 
     pub fn tick_interval(&self) -> Duration {
+        if self.pending_release.is_some() {
+            return Duration::from_millis(5);
+        }
         match self.phase {
             Phase::Idle => Duration::from_millis(250),
             Phase::Running { .. } => Duration::from_millis(100),
-            _ => Duration::from_millis(40),
+            // redraw often enough that the timer turns green on time
+            Phase::Holding { .. } => Duration::from_millis(16),
+            Phase::Inspecting { .. } => Duration::from_millis(40),
         }
     }
 
-    pub fn on_tick(&mut self, _now: Instant) {
+    pub fn on_tick(&mut self, now: Instant) {
+        self.flush_release(now);
         if self.toast.as_ref().is_some_and(|(_, t)| t.elapsed() >= TOAST_TIME) {
             self.toast = None;
         }
@@ -215,7 +225,8 @@ impl App {
         if key.code == KeyCode::Char(' ') {
             // Keep the space bookkeeping right if its release arrives now.
             if key.kind == KeyEventKind::Release {
-                self.space_up(now);
+                self.pending_release = None;
+                self.finish_release(now);
             }
             return;
         }
@@ -241,41 +252,70 @@ impl App {
         }
     }
 
-    /// Tap mode only: is this space event a key auto-repeat / bounce rather
-    /// than a deliberate press?
+    /// Minimum time since the last accepted press, for a press in the current
+    /// phase (tap mode).
+    fn tap_gap(&self) -> Duration {
+        match self.phase {
+            Phase::Running { .. } => TAP_GAP_STOP,
+            Phase::Inspecting { .. } => TAP_GAP_START,
+            _ => Duration::ZERO,
+        }
+    }
+
+    /// Tap mode only: is this space event a key auto-repeat rather than a
+    /// deliberate press?
     ///
     /// A held key shows up as a stream of presses: the first repeat comes after
-    /// the keyboard's repeat delay, then one every ~30 ms. Both are caught: the
-    /// first by the time since the last press we *acted on*, the rest because
-    /// they follow each other closely.
+    /// the keyboard's repeat delay, then one every ~30 ms. The stream is caught
+    /// because its events follow each other closely; the first repeat by the
+    /// per-phase gap since the last press we *acted on*.
     ///
-    /// Important: the reference for the debounce is the last *accepted* press.
-    /// (Measuring from the last event of any kind would let a player who taps
-    /// every ~half second keep postponing the debounce forever, so the second
-    /// tap - the one that should start the timer - would never be accepted.)
+    /// Important: the reference is the last *accepted* press. (Measuring from
+    /// the last event of any kind would let a player who taps every ~half
+    /// second keep postponing the debounce forever.) Stopping only needs a
+    /// short gap so that sub-second solves can be stopped.
     fn is_bounce(&mut self, now: Instant) -> bool {
         let in_stream = self
             .last_space_event
             .is_some_and(|t| now.saturating_duration_since(t) < REPEAT_GAP);
+        let gap = self.tap_gap();
         let after_accept = self
             .last_space_accept
-            .is_some_and(|t| now.saturating_duration_since(t) < TAP_DEBOUNCE);
+            .is_some_and(|t| now.saturating_duration_since(t) < gap);
         self.last_space_event = Some(now);
         in_stream || after_accept
     }
 
     fn space_down(&mut self, now: Instant) {
         if self.hold_mode {
+            // A release that has waited long enough is a real one.
+            self.flush_release(now);
+            if self.pending_release.take().is_some() {
+                // Release immediately followed by a press: that is how the
+                // auto-repeat of a held key shows up on some systems. The key
+                // never went up; ignore both events.
+                self.last_space_event = Some(now);
+                return;
+            }
             if self.space_is_down {
-                // A press with no release in between.
+                let since_last = self
+                    .last_space_event
+                    .map_or(Duration::MAX, |t| now.saturating_duration_since(t));
+                if since_last < HOLD_REPEAT_GAP {
+                    // Auto-repeat that the terminal reported as a press.
+                    self.last_space_event = Some(now);
+                    return;
+                }
+                // A genuinely new press with no release in between.
                 if self.releases_seen {
                     // The terminal does send releases, so one got lost (focus
                     // change, ...). Treat this press as the missing release so
                     // the timer can never get stuck in "holding".
                     let was_holding = matches!(self.phase, Phase::Holding { .. });
-                    self.space_up(now);
+                    self.finish_release(now);
                     if was_holding && matches!(self.phase, Phase::Running { .. }) {
                         self.space_is_down = true; // the key is physically down again
+                        self.last_space_event = Some(now);
                         return;
                     }
                 } else {
@@ -285,8 +325,10 @@ impl App {
                     self.fall_back_to_tap("no key-release events from this terminal: tap mode");
                 }
             }
-            self.space_is_down = true;
-            self.last_space_press = Some(now);
+            if self.hold_mode {
+                self.space_is_down = true;
+                self.last_space_event = Some(now);
+            }
         }
 
         if !self.hold_mode && self.is_bounce(now) {
@@ -319,56 +361,52 @@ impl App {
         }
     }
 
+    /// A space release event arrived.
     fn space_up(&mut self, now: Instant) {
         self.releases_seen = true;
-        self.space_is_down = false;
-        let held = self.last_space_press.map(|t| now.saturating_duration_since(t));
-
-        // A release that arrives together with its press is fabricated by the
-        // terminal / multiplexer: the key's real state is unknowable, so
-        // "hold until green" can never work. Switch to tap mode right away.
-        if self.hold_mode && held.is_some_and(|h| h < SYNTHETIC_RELEASE) {
-            self.fall_back_to_tap(
-                "terminal reports key releases instantly: tap mode (space starts, space stops)",
-            );
-            self.treat_next_events_as_repeat(now);
+        if !self.hold_mode {
+            self.space_is_down = false;
             return;
         }
+        self.flush_release(now);
+        if self.space_is_down && self.pending_release.is_none() {
+            // Wait briefly: a press right behind it means auto-repeat.
+            self.pending_release = Some(now);
+        }
+    }
 
-        if let Phase::Holding { since, inspect_start } = self.phase {
-            if now.saturating_duration_since(since) >= HOLD_TO_READY {
-                self.early_releases = 0;
-                self.start_run(inspect_start, now);
-                return;
-            }
-            // released too early: go back
-            self.phase = match inspect_start {
-                Some(start) => Phase::Inspecting { start },
-                None => Phase::Idle,
-            };
-            let recent = self
-                .last_early_release
-                .is_some_and(|t| now.saturating_duration_since(t) < EARLY_RELEASE_WINDOW);
-            self.early_releases = if recent { self.early_releases + 1 } else { 1 };
-            self.last_early_release = Some(now);
-            if self.early_releases >= EARLY_RELEASES_BEFORE_TAP {
-                // Holding keeps failing (typically: the terminal's releases do
-                // not match the physical key). Don't leave the player stuck.
-                self.fall_back_to_tap("hold not detected: tap mode (space starts, space stops)");
-                self.treat_next_events_as_repeat(now);
-            } else {
-                let ms = held.map_or(0, |h| h.as_millis());
-                self.toast(format!(
-                    "released after {ms} ms: hold space until the timer turns green"
-                ));
+    /// Turn a pending release into a real one once nothing followed it.
+    fn flush_release(&mut self, now: Instant) {
+        if let Some(at) = self.pending_release {
+            if now.saturating_duration_since(at) >= RELEASE_GRACE {
+                self.pending_release = None;
+                self.finish_release(at);
             }
         }
     }
 
-    /// Leave hold mode (the terminal can't be trusted with key releases).
+    /// The key really went up at `now` (the release's own timestamp).
+    fn finish_release(&mut self, now: Instant) {
+        self.releases_seen = true;
+        self.space_is_down = false;
+        if let Phase::Holding { since, inspect_start } = self.phase {
+            if now.saturating_duration_since(since) >= HOLD_TO_READY {
+                self.start_run(inspect_start, now);
+            } else {
+                // Released too early: silently go back to where we were.
+                self.phase = match inspect_start {
+                    Some(start) => Phase::Inspecting { start },
+                    None => Phase::Idle,
+                };
+            }
+        }
+    }
+
+    /// Leave hold mode (only used when no release has ever been delivered).
     fn fall_back_to_tap(&mut self, why: &str) {
         self.hold_mode = false;
         self.space_is_down = false;
+        self.pending_release = None;
         if let Phase::Holding { inspect_start, .. } = self.phase {
             self.phase = match inspect_start {
                 Some(start) => Phase::Inspecting { start },
@@ -378,11 +416,22 @@ impl App {
         self.toast(why);
     }
 
-    /// The key may still be physically held after a mode switch: whatever
-    /// auto-repeat it produces must not count as a fresh tap.
-    fn treat_next_events_as_repeat(&mut self, now: Instant) {
-        self.last_space_accept = Some(now);
-        self.last_space_event = Some(now);
+    /// `t`: switch between hold and tap mode by hand.
+    fn toggle_mode(&mut self) {
+        if self.hold_mode {
+            self.hold_mode = false;
+            self.space_is_down = false;
+            self.pending_release = None;
+            self.toast("tap mode: space starts, space stops");
+        } else if self.can_hold {
+            self.hold_mode = true;
+            self.space_is_down = false;
+            self.pending_release = None;
+            self.releases_seen = false;
+            self.toast("hold mode: hold space until green, release to start");
+        } else {
+            self.toast("this terminal can't report key releases: tap mode only");
+        }
     }
 
     fn start_run(&mut self, inspect_start: Option<Instant>, now: Instant) {
@@ -448,6 +497,13 @@ impl App {
                 } else {
                     self.copy(self.scramble.clone(), "scramble");
                 }
+            }
+            return;
+        }
+        // So is switching between hold and tap mode.
+        if let KeyCode::Char('t') = code {
+            if !repeat {
+                self.toggle_mode();
             }
             return;
         }
@@ -532,8 +588,15 @@ mod tests {
     fn press(app: &mut App, c: KeyCode, t: Instant) {
         app.on_key(key(c, KeyEventKind::Press), t);
     }
-    fn release(app: &mut App, c: KeyCode, t: Instant) {
+    /// A release as it arrives from the terminal, with no event loop tick.
+    fn release_raw(app: &mut App, c: KeyCode, t: Instant) {
         app.on_key(key(c, KeyEventKind::Release), t);
+    }
+    /// A real release: nothing follows it, so the event loop's tick (a little
+    /// later) turns it into a finished release.
+    fn release(app: &mut App, c: KeyCode, t: Instant) {
+        release_raw(app, c, t);
+        app.on_tick(t + Duration::from_millis(60));
     }
     fn press_mod(app: &mut App, c: KeyCode, m: KeyModifiers, t: Instant) {
         app.on_key(KeyEvent::new_with_kind(c, m, KeyEventKind::Press), t);
@@ -574,8 +637,9 @@ mod tests {
         assert!(!a.scramble.is_empty());
     }
 
+    /// Letting go too early silently returns to the inspection: no message.
     #[test]
-    fn early_release_explains_itself() {
+    fn early_release_goes_back_silently() {
         let t = Instant::now();
         let mut a = app(true, true);
         press(&mut a, SP, t);
@@ -583,7 +647,12 @@ mod tests {
         press(&mut a, SP, ms(t, 2000));
         release(&mut a, SP, ms(t, 2100)); // quick tap
         assert!(matches!(a.phase, Phase::Inspecting { .. }));
-        assert!(a.active_toast().is_some_and(|m| m.contains("hold space")));
+        assert!(a.active_toast().is_none());
+        assert!(a.hold_mode);
+        // ...and a proper hold still works afterwards
+        press(&mut a, SP, ms(t, 3000));
+        release(&mut a, SP, ms(t, 3400));
+        assert!(matches!(a.phase, Phase::Running { .. }));
     }
 
     #[test]
@@ -638,6 +707,25 @@ mod tests {
         assert!(matches!(a.phase, Phase::Running { .. }));
     }
 
+    /// Regression: a flat 0.8 s debounce made solves under 0.8 s impossible to
+    /// stop in tap mode.
+    #[test]
+    fn tap_mode_allows_sub_second_solves() {
+        let t = Instant::now();
+        let mut a = app(false, false);
+        press(&mut a, SP, t); // start
+        press(&mut a, SP, ms(t, 400)); // stop
+        assert_eq!(a.solves.len(), 1);
+        assert_eq!(a.solves[0].time_ms, 400);
+
+        let mut a = app(false, true);
+        press(&mut a, SP, t); // inspect
+        press(&mut a, SP, ms(t, 1000)); // start
+        press(&mut a, SP, ms(t, 1400)); // stop
+        assert_eq!(a.solves.len(), 1);
+        assert_eq!(a.solves[0].time_ms, 400);
+    }
+
     #[test]
     fn tap_mode_without_inspection() {
         let t = Instant::now();
@@ -674,10 +762,11 @@ mod tests {
         assert_eq!(a.solves.len(), 1);
     }
 
-    /// ...and the first auto-repeat of the very first press (reported as a
-    /// press by such a terminal) must not start the timer by accident.
+    /// Auto-repeat of a held key that a terminal reports as presses must not
+    /// start the timer, and must not be mistaken for "no releases": it is just
+    /// ignored and hold mode stays on.
     #[test]
-    fn fallback_does_not_misread_autorepeat_as_start() {
+    fn autorepeat_reported_as_press_is_ignored() {
         let t = Instant::now();
         let mut a = app(true, true);
         press(&mut a, SP, t);
@@ -685,9 +774,32 @@ mod tests {
         for i in 1..30 {
             press(&mut a, SP, ms(t, 500 + i * 30));
         }
-        assert!(!a.hold_mode);
+        assert!(a.hold_mode);
         assert!(matches!(a.phase, Phase::Inspecting { .. }));
+        // a real press much later, with still no release ever seen: tap mode
         press(&mut a, SP, ms(t, 3000));
+        assert!(!a.hold_mode);
+        assert!(matches!(a.phase, Phase::Running { .. }));
+    }
+
+    #[test]
+    fn hold_mode_survives_repeats_reported_as_presses() {
+        let t = Instant::now();
+        let mut a = app(true, true);
+        press(&mut a, SP, t);
+        for i in 0..40 {
+            press(&mut a, SP, ms(t, 600 + i * 30)); // auto-repeat as Press
+        }
+        assert!(a.hold_mode);
+        assert!(matches!(a.phase, Phase::Inspecting { .. }));
+        release(&mut a, SP, ms(t, 2000));
+        press(&mut a, SP, ms(t, 3000)); // real press: hold
+        for i in 0..20 {
+            press(&mut a, SP, ms(t, 3600 + i * 30)); // repeats while holding
+        }
+        assert!(matches!(a.phase, Phase::Holding { .. }));
+        release(&mut a, SP, ms(t, 4400));
+        assert!(a.hold_mode);
         assert!(matches!(a.phase, Phase::Running { .. }));
     }
 
@@ -712,88 +824,99 @@ mod tests {
         release(&mut a, SP, ms(t, 60)); // proves releases work
         press(&mut a, SP, ms(t, 2000)); // -> Holding
         assert!(matches!(a.phase, Phase::Holding { .. }));
-        // release lost; user presses again 600 ms later
-        press(&mut a, SP, ms(t, 2600));
+        // release lost; user presses again 1.5 s later
+        press(&mut a, SP, ms(t, 3500));
         assert!(a.hold_mode);
         assert!(matches!(a.phase, Phase::Running { .. }));
         // the stop press still works and its own release is harmless
-        release(&mut a, SP, ms(t, 2700));
+        release(&mut a, SP, ms(t, 3600));
         press(&mut a, SP, ms(t, 9000));
         assert_eq!(a.solves.len(), 1);
     }
 
-    /// Terminals / multiplexers that fabricate a release right after every
-    /// press made "hold until green" impossible: the timer never turned green.
+    /// Regression: an instant release used to throw the app into tap mode for
+    /// good. Now it only fails that one hold; holding works afterwards.
     #[test]
-    fn instant_fake_release_falls_back_to_tap() {
+    fn instant_release_does_not_leave_hold_mode() {
         let t = Instant::now();
         let mut a = app(true, true);
         press(&mut a, SP, t);
-        release(&mut a, SP, t); // same instant: fabricated
-        assert!(!a.hold_mode);
-        assert!(a.active_toast().is_some_and(|m| m.contains("tap mode")));
+        release(&mut a, SP, t); // same instant
+        assert!(a.hold_mode);
         assert!(matches!(a.phase, Phase::Inspecting { .. }));
-        // the key is held: fake press/release pairs keep coming, none counts
-        for i in 1..20 {
-            press(&mut a, SP, ms(t, i * 30));
-            release(&mut a, SP, ms(t, i * 30));
+        press(&mut a, SP, ms(t, 1000));
+        assert!(matches!(a.phase, Phase::Holding { .. }));
+        release(&mut a, SP, ms(t, 1400));
+        assert!(matches!(a.phase, Phase::Running { .. }));
+    }
+
+    #[test]
+    fn t_toggles_mode_only_when_releases_are_available() {
+        let t = Instant::now();
+        let mut a = app(true, true);
+        press(&mut a, KeyCode::Char('t'), t);
+        assert!(!a.hold_mode);
+        press(&mut a, KeyCode::Char('t'), t);
+        assert!(a.hold_mode);
+
+        // a terminal without release support stays in tap mode
+        let mut b = app(false, true);
+        press(&mut b, KeyCode::Char('t'), t);
+        assert!(!b.hold_mode);
+        assert!(b.active_toast().is_some_and(|m| m.contains("can't report")));
+    }
+
+    /// Regression: on X11-like systems the auto-repeat of a held key arrives as
+    /// "release + press" pairs every ~25 ms. That used to restart the hold timer
+    /// each time, so the timer never turned green.
+    #[test]
+    fn autorepeat_as_release_press_pairs_keeps_the_key_held() {
+        let t = Instant::now();
+        let mut a = app(true, true);
+        press(&mut a, SP, t); // start inspection, key still held
+        for i in 0..20 {
+            release_raw(&mut a, SP, ms(t, 200 + i * 25));
+            press(&mut a, SP, ms(t, 201 + i * 25));
+            assert!(matches!(a.phase, Phase::Inspecting { .. }), "pair {i}");
         }
+        release(&mut a, SP, ms(t, 800)); // real release
         assert!(matches!(a.phase, Phase::Inspecting { .. }));
-        // a real tap later starts the timer, another one stops it
-        press(&mut a, SP, ms(t, 3000));
-        release(&mut a, SP, ms(t, 3000));
+
+        press(&mut a, SP, ms(t, 2000)); // hold
+        for i in 0..40 {
+            release_raw(&mut a, SP, ms(t, 2200 + i * 25));
+            press(&mut a, SP, ms(t, 2201 + i * 25));
+        }
+        match a.phase {
+            Phase::Holding { since, .. } => assert_eq!(since, ms(t, 2000)),
+            other => panic!("expected Holding, got {other:?}"),
+        }
+        assert!(a.hold_mode);
+        release(&mut a, SP, ms(t, 3300)); // real release, held 1.3 s
         assert!(matches!(a.phase, Phase::Running { .. }));
-        press(&mut a, SP, ms(t, 9000));
-        release(&mut a, SP, ms(t, 9000));
+        // the solve starts at the real release time, not when it was flushed
+        press(&mut a, SP, ms(t, 3300 + 700));
+        assert_eq!(a.solves[0].time_ms, 700);
+    }
+
+    /// Holding the stop key down must not start a new inspection through its
+    /// auto-repeat pairs.
+    #[test]
+    fn held_stop_key_does_not_restart_inspection() {
+        let t = Instant::now();
+        let mut a = app(true, false);
+        press(&mut a, SP, t);
+        release(&mut a, SP, ms(t, 400)); // running
+        assert!(matches!(a.phase, Phase::Running { .. }));
+        press(&mut a, SP, ms(t, 5000)); // stop, key stays down
         assert_eq!(a.solves.len(), 1);
-        assert_eq!(a.solves[0].time_ms, 6000);
-    }
-
-    /// Releases that arrive a little later than "instantly" but still before
-    /// the timer is green, twice in a row: holding does not work -> tap mode.
-    #[test]
-    fn repeated_early_releases_fall_back_to_tap() {
-        let t = Instant::now();
-        let mut a = app(true, true);
-        press(&mut a, SP, t);
-        release(&mut a, SP, ms(t, 60));
-        press(&mut a, SP, ms(t, 1000));
-        release(&mut a, SP, ms(t, 1100)); // early #1: just a hint
-        assert!(a.hold_mode);
-        assert!(a.active_toast().is_some_and(|m| m.contains("released after 100 ms")));
-        press(&mut a, SP, ms(t, 2000));
-        release(&mut a, SP, ms(t, 2100)); // early #2: give up on holding
-        assert!(!a.hold_mode);
-        assert!(matches!(a.phase, Phase::Inspecting { .. }));
-        press(&mut a, SP, ms(t, 5000)); // tap starts the solve
-        assert!(matches!(a.phase, Phase::Running { .. }));
-    }
-
-    #[test]
-    fn a_successful_hold_resets_the_early_release_count() {
-        let t = Instant::now();
-        let mut a = app(true, false);
-        press(&mut a, SP, t);
-        release(&mut a, SP, ms(t, 100)); // early #1
-        press(&mut a, SP, ms(t, 1000));
-        release(&mut a, SP, ms(t, 1400)); // proper hold -> running
-        assert!(matches!(a.phase, Phase::Running { .. }));
-        press(&mut a, SP, ms(t, 6000)); // stop
-        release(&mut a, SP, ms(t, 6080));
-        press(&mut a, SP, ms(t, 7000));
-        release(&mut a, SP, ms(t, 7100)); // early again, but only #1 now
-        assert!(a.hold_mode);
-    }
-
-    #[test]
-    fn early_releases_far_apart_do_not_add_up() {
-        let t = Instant::now();
-        let mut a = app(true, false);
-        press(&mut a, SP, t);
-        release(&mut a, SP, ms(t, 100)); // early #1
-        press(&mut a, SP, ms(t, 60_000));
-        release(&mut a, SP, ms(t, 60_100)); // a minute later: counts as #1 again
-        assert!(a.hold_mode);
+        for i in 0..30 {
+            release_raw(&mut a, SP, ms(t, 5400 + i * 25));
+            press(&mut a, SP, ms(t, 5401 + i * 25));
+        }
+        assert!(matches!(a.phase, Phase::Idle));
+        release(&mut a, SP, ms(t, 6300));
+        assert!(matches!(a.phase, Phase::Idle));
     }
 
     fn with_solves(n: usize) -> App {
@@ -854,8 +977,10 @@ mod tests {
         press_mod(&mut a, KeyCode::Char('d'), KeyModifiers::CONTROL, t); // not "DNF"
         press_mod(&mut a, KeyCode::Char('q'), KeyModifiers::ALT, t); // not "quit"
         press_mod(&mut a, KeyCode::Char('?'), KeyModifiers::CONTROL, t);
+        press_mod(&mut a, KeyCode::Char('t'), KeyModifiers::CONTROL, t); // not "toggle mode"
         assert_eq!(a.solves.len(), 3);
         assert_eq!(a.solves[2].penalty, Penalty::None);
+        assert!(a.hold_mode);
         assert!(!a.should_quit);
         assert!(!a.show_help);
         press_mod(&mut a, KeyCode::Char('c'), KeyModifiers::CONTROL, t); // Ctrl-C still quits
@@ -922,6 +1047,9 @@ mod tests {
         assert!(matches!(a.phase, Phase::Running { .. }));
         press(&mut a, KeyCode::Char('?'), ms(t, 1500));
         assert!(!a.show_help);
+        // the mode can't be switched while the timer runs either
+        press(&mut a, KeyCode::Char('t'), ms(t, 1600));
+        assert!(a.hold_mode);
     }
 
     #[test]

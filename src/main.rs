@@ -27,9 +27,9 @@ USAGE:
     rcube [OPTIONS]
 
 OPTIONS:
-        --tap            Tap mode: never rely on key-release events
-                         (space = inspect/start/stop; chosen automatically
-                         when the terminal can't report key releases)
+        --tap            Start in tap mode (space = inspect/start/stop).
+                         Chosen automatically when the terminal can't report
+                         key releases; press t inside rcube to switch
         --no-inspect     Disable the 15 second inspection
         --data <FILE>    Use a different solves file
     -h, --help           Show this help
@@ -37,6 +37,7 @@ OPTIONS:
 KEYS:
     ?                press inside rcube for the full list of key bindings
     space            inspect -> hold (green) -> release to start -> space to stop
+    t                switch between hold mode and tap mode
     q or Ctrl-C      quit
 
 DATA:
@@ -82,8 +83,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     // "hold space, release to start" works. Not available everywhere. If
     // anything about this fails we simply stay in tap mode (and never bail out
     // with `?` here: the terminal is already in raw mode and must be restored).
-    let enhanced = !opts.tap
-        && supports_keyboard_enhancement().unwrap_or(false)
+    //
+    // The protocol is requested even with `--tap`, so that `t` can still switch
+    // to hold mode later; `--tap` only chooses the starting mode.
+    let enhanced = supports_keyboard_enhancement().unwrap_or(false)
         && execute!(
             stdout(),
             PushKeyboardEnhancementFlags(
@@ -100,7 +103,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             prev(info);
         }));
     }
-    app.hold_mode = enhanced;
+    app.can_hold = enhanced;
+    app.hold_mode = enhanced && !opts.tap;
 
     let result = run(&mut terminal, &mut app);
 
