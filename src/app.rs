@@ -70,6 +70,8 @@ pub struct App {
     pub should_quit: bool,
     /// Key-binding help window (`?`).
     pub show_help: bool,
+    /// Details window for the selected solve (`Enter`).
+    pub show_detail: bool,
     /// Scroll offset of the help window. A `Cell` so the renderer can clamp it
     /// to the window size without needing `&mut App`.
     pub help_scroll: Cell<u16>,
@@ -132,6 +134,7 @@ impl App {
             inspection,
             should_quit: false,
             show_help: false,
+            show_detail: false,
             help_scroll: Cell::new(0),
             last_space_event: None,
             last_space_accept: None,
@@ -211,6 +214,10 @@ impl App {
             self.help_key(key, now);
             return;
         }
+        if self.show_detail {
+            self.detail_key(key, now);
+            return;
+        }
         match (key.code, key.kind) {
             (KeyCode::Char(' '), KeyEventKind::Press) => self.space_down(now),
             (KeyCode::Char(' '), KeyEventKind::Release) => self.space_up(now),
@@ -220,14 +227,23 @@ impl App {
         }
     }
 
+    /// Space events while a pop-up window is open: they never start anything,
+    /// but a release must still be tracked so the next press is not mistaken
+    /// for a lost release. Returns true when the key was a space event.
+    fn swallow_space(&mut self, key: &KeyEvent, now: Instant) -> bool {
+        if key.code != KeyCode::Char(' ') {
+            return false;
+        }
+        if key.kind == KeyEventKind::Release {
+            self.pending_release = None;
+            self.finish_release(now);
+        }
+        true
+    }
+
     /// Keys while the help window is open: close or scroll, nothing else.
     fn help_key(&mut self, key: KeyEvent, now: Instant) {
-        if key.code == KeyCode::Char(' ') {
-            // Keep the space bookkeeping right if its release arrives now.
-            if key.kind == KeyEventKind::Release {
-                self.pending_release = None;
-                self.finish_release(now);
-            }
+        if self.swallow_space(&key, now) {
             return;
         }
         if key.kind == KeyEventKind::Release {
@@ -248,6 +264,35 @@ impl App {
             }
             KeyCode::Home | KeyCode::Char('g') => self.help_scroll.set(0),
             KeyCode::End => self.help_scroll.set(HELP_SCROLL_MAX),
+            _ => {}
+        }
+    }
+
+    /// Keys while the solve details window is open: close it, or browse to
+    /// another solve (the window follows the selection). Nothing else.
+    fn detail_key(&mut self, key: KeyEvent, now: Instant) {
+        if self.swallow_space(&key, now) {
+            return;
+        }
+        if key.kind == KeyEventKind::Release {
+            return;
+        }
+        if key.code != KeyCode::Esc && has_command_modifier(&key) {
+            return;
+        }
+        let (code, shift) = normalize(&key);
+        let last = self.solves.len().saturating_sub(1);
+        match code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => self.show_detail = false,
+            KeyCode::Char('k') | KeyCode::Char('h') | KeyCode::Up | KeyCode::Left => {
+                self.selected = (self.selected + 1).min(last)
+            }
+            KeyCode::Char('j') | KeyCode::Char('l') | KeyCode::Down | KeyCode::Right => {
+                self.selected = self.selected.saturating_sub(1)
+            }
+            KeyCode::Home => self.selected = last,
+            KeyCode::End => self.selected = 0,
+            KeyCode::Char('g') => self.selected = if shift { 0 } else { last },
             _ => {}
         }
     }
@@ -525,6 +570,11 @@ impl App {
                 self.selected = if shift { 0 } else { self.solves.len().saturating_sub(1) }
             }
             _ if repeat => {}
+            KeyCode::Enter => {
+                if self.selected_solve().is_some() {
+                    self.show_detail = true;
+                }
+            }
             KeyCode::Char('?') | KeyCode::F(1) => {
                 self.help_scroll.set(0);
                 self.show_help = true;
@@ -978,11 +1028,13 @@ mod tests {
         press_mod(&mut a, KeyCode::Char('q'), KeyModifiers::ALT, t); // not "quit"
         press_mod(&mut a, KeyCode::Char('?'), KeyModifiers::CONTROL, t);
         press_mod(&mut a, KeyCode::Char('t'), KeyModifiers::CONTROL, t); // not "toggle mode"
+        press_mod(&mut a, KeyCode::Enter, KeyModifiers::CONTROL, t); // not "details"
         assert_eq!(a.solves.len(), 3);
         assert_eq!(a.solves[2].penalty, Penalty::None);
         assert!(a.hold_mode);
         assert!(!a.should_quit);
         assert!(!a.show_help);
+        assert!(!a.show_detail);
         press_mod(&mut a, KeyCode::Char('c'), KeyModifiers::CONTROL, t); // Ctrl-C still quits
         assert!(a.should_quit);
     }
@@ -1066,6 +1118,80 @@ mod tests {
         release(&mut a, SP, ms(t, 150)); // release arrives while help is open
         press(&mut a, KeyCode::Esc, ms(t, 200)); // close help
         assert!(!a.show_help);
+
+        press(&mut a, SP, ms(t, 1000));
+        assert!(a.hold_mode);
+        assert!(matches!(a.phase, Phase::Inspecting { .. }));
+    }
+
+    #[test]
+    fn enter_opens_and_closes_the_detail_window() {
+        let t = Instant::now();
+        let mut a = with_solves(3);
+        assert_eq!(a.selected, 2);
+        press(&mut a, KeyCode::Enter, t);
+        assert!(a.show_detail);
+
+        // browsing moves the selection while the window stays open
+        press(&mut a, KeyCode::Char('j'), t);
+        assert_eq!(a.selected, 1);
+        press(&mut a, KeyCode::Down, t);
+        assert_eq!(a.selected, 0);
+        press(&mut a, KeyCode::Char('k'), t);
+        assert_eq!(a.selected, 1);
+        press(&mut a, KeyCode::Char('G'), t);
+        assert_eq!(a.selected, 0);
+        press(&mut a, KeyCode::Char('g'), t);
+        assert_eq!(a.selected, 2);
+        assert!(a.show_detail);
+
+        // everything else is inert while it is open
+        press(&mut a, KeyCode::Char('d'), t);
+        press(&mut a, KeyCode::Char('2'), t);
+        press(&mut a, KeyCode::Delete, t);
+        press(&mut a, KeyCode::Char('r'), t);
+        press(&mut a, SP, t);
+        assert_eq!(a.solves.len(), 3);
+        assert_eq!(a.solves[2].penalty, Penalty::None);
+        assert!(matches!(a.phase, Phase::Idle));
+        assert!(!a.show_help);
+
+        // Enter, Esc and q all close it; q does not quit
+        press(&mut a, KeyCode::Enter, t);
+        assert!(!a.show_detail);
+        press(&mut a, KeyCode::Enter, t);
+        press(&mut a, KeyCode::Esc, t);
+        assert!(!a.show_detail);
+        press(&mut a, KeyCode::Enter, t);
+        press(&mut a, KeyCode::Char('q'), t);
+        assert!(!a.show_detail);
+        assert!(!a.should_quit);
+    }
+
+    #[test]
+    fn detail_window_needs_a_solve_and_an_idle_timer() {
+        let t = Instant::now();
+        let mut a = with_solves(0);
+        press(&mut a, KeyCode::Enter, t);
+        assert!(!a.show_detail);
+
+        let mut a = with_solves(2);
+        press(&mut a, SP, t); // inspecting
+        press(&mut a, KeyCode::Enter, ms(t, 100));
+        assert!(!a.show_detail);
+    }
+
+    #[test]
+    fn detail_window_does_not_break_space_bookkeeping() {
+        let t = Instant::now();
+        let mut a = with_solves(1);
+        press(&mut a, SP, t); // inspecting, space physically down
+        press(&mut a, KeyCode::Esc, ms(t, 50)); // cancel -> idle
+        press(&mut a, KeyCode::Enter, ms(t, 100));
+        assert!(a.show_detail);
+        release(&mut a, SP, ms(t, 150)); // release arrives while the window is open
+        press(&mut a, KeyCode::Esc, ms(t, 200));
+        assert!(!a.show_detail);
 
         press(&mut a, SP, ms(t, 1000));
         assert!(a.hold_mode);

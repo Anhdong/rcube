@@ -9,8 +9,10 @@ with [ratatui](https://ratatui.rs) and crossterm.
 - WCA-style 15 s inspection with automatic +2 (after 15 s) and DNF (after 17 s)
 - Time hidden while solving and replaced by a white `SOLVING`
 - Result list with an ao5 next to every result, plus ao12, ao100, mean and bests
-- Scramble centred above the timer; compact cube net (U / L F R B / D) in the bottom-right corner
+- Statistics centred under the timer
+- Scramble centred above the timer, with some margin to the screen edge; compact cube net (U / L F R B / D) in the bottom-right corner
 - Results panel (bottom-left) sized for the last 5 solves; the selection scrolls through older ones
+- Details window for the highlighted solve (`Enter`): time, penalty, averages, date and scramble
 - Clean screen: all key bindings live in a help window, opened with `?`
 - Vim-style navigation and editing of results
 - Single-file JSON storage that is easy to back up
@@ -46,6 +48,7 @@ help is available when no solve is in progress.
 | `space`                   | inspect, hold (turns green), release to start, `space` to stop  |
 | `h` `j` `k` `l`, arrows   | move between results (`k`/`h` = older, `j`/`l` = newer)         |
 | `g` / `G`, Home / End     | first / last result                                             |
+| `Enter`                   | show the details of the selected result in a window             |
 | `2`                       | toggle +2 on the selected result                                |
 | `d`                       | toggle DNF on the selected result                               |
 | `Delete` (or `x`)         | delete the selected result                                      |
@@ -58,6 +61,18 @@ help is available when no solve is in progress.
 
 Ctrl/Alt combinations are never treated as commands (so `Ctrl-X` can not delete
 a solve); only `Ctrl-C` is special.
+
+### Solve details window
+
+`Enter` opens a window with everything about the highlighted solve: the time
+as it counts (with +2 or DNF applied), the raw time, the penalty, the ao5 /
+ao12 / ao100 ending at that solve, whether it is a best single or best ao5,
+when it was solved (UTC) and its scramble.
+
+While the window is open, `h` `j` `k` `l` / arrows / `g` / `G` / Home / End
+browse to other solves and the window follows the selection. `Enter`, `Esc`
+or `q` closes it (`q` does not quit). Editing keys do nothing while it is open;
+close it first. It is only available when no solve is in progress.
 
 ## Timer colours
 
@@ -108,11 +123,11 @@ forever; the first tap after 0.8 s is accepted.
 
                             big timer
 
- .- results (n) ---.     badge                     .- scramble -.
- | #   time    ao5 |     ao5 / ao12 / ao100 / mean |  cube net   |
- | 8  10.21   9.86 |     best / best ao5           |  (compact)  |
- | ...  5 rows     |     selected solve + scramble |             |
- '- 12/12 ---------'                               '-------------'
+ .- results (n) ---.        badge                    .- scramble -.
+ | #   time    ao5 |   ao5 / ao12 / ao100 / mean     |  cube net   |
+ | 8  10.21   9.86 |      best / best ao5            |  (compact)  |
+ | ...  5 rows     |                                 |             |
+ '- 12/12 ---------'                                 '-------------'
  ? help
 ```
 
@@ -121,9 +136,16 @@ five solves. Move the selection (`k`/`j`, `g`/`G`, arrows) to scroll the list;
 the bottom border shows the position (`4/12`) once there are more than five
 solves.
 
-The results panel needs 75 columns, the cube net 104 (the statistics line in
-the middle needs the room). When the window is short, the bottom row shrinks
+The badge and statistics are centred on the screen, as long as the window is
+wide enough (about 117 columns with both panels visible). On narrower windows
+they sit in the column between the two panels instead.
+
+The results panel needs 75 columns, the cube net 104 (the statistics line
+needs 57 columns of room). When the window is short, the bottom row shrinks
 first, keeping the timer at least 7 rows tall.
+
+The solve details window and the help window are pop-ups drawn in the middle
+of the screen on top of everything else.
 
 ## Data storage
 
@@ -153,6 +175,7 @@ All solves live in one human-readable file:
 - `event` allows other puzzles to share the file later. Solves of events this
   version does not know are preserved untouched.
 - `id` is unique and time-sortable, so files from two machines can be merged.
+- `timestamp` is Unix milliseconds; the details window shows it as UTC.
 - Writes are atomic (temp file, fsync, rename, directory fsync), a failed write
   leaves no stray temp file, and the previous file is copied to
   `solves.json.bak` on every start.
@@ -163,8 +186,8 @@ All solves live in one human-readable file:
 
 ```
 src/main.rs       terminal setup, event loop, command-line options
-src/app.rs        state machine (idle / inspect / hold / run), key handling, help state
-src/ui.rs         rendering: results, timer, scramble panel, help window
+src/app.rs        state machine (idle / inspect / hold / run), key handling, help and details state
+src/ui.rs         rendering: results, timer, scramble panel, help and details windows
 src/big.rs        big block-letter font (three sizes, chosen to fit the window)
 src/cube.rs       sticker-level cube model used for the scramble preview
 src/scramble.rs   random-move scramble generator (20 moves, no redundant turns)
@@ -175,11 +198,14 @@ src/clipboard.rs  clipboard helpers
 
 ## Testing
 
-`cargo test` runs 53 unit tests covering cube moves and net orientation,
+`cargo test` runs the unit tests covering cube moves and net orientation,
 scramble rules, averages with DNF and +2, the timer state machine in both hold
 and tap mode (including auto-repeat, lost key releases and terminals that never
-send releases), the help window, storage round-trips, and rendering at many
-terminal sizes (panel geometry, the 5-solve results window and its scrolling, centred scramble text, the compact cube net, the help window, no panics).
+send releases), the help and details windows (opening, closing, browsing, space
+bookkeeping, timestamp formatting), storage round-trips, and rendering at many
+terminal sizes (panel geometry, the 5-solve results window and its scrolling,
+centred scramble text and statistics, the compact cube net, both pop-up
+windows, no panics).
 
 The release binary was also driven through a pseudo-terminal, once as a legacy
 terminal (tap mode) and once emulating a kitty-protocol terminal (hold mode),
@@ -192,5 +218,6 @@ Clipboard integration and real-terminal appearance have not been tested.
 - 3x3 only for now; the `event` field in the data file is the hook for other puzzles.
 - All solves share one list (no sessions yet).
 - The results panel is hidden below 75 columns, the cube net below 104.
+- The details window shows times in UTC and does not draw the scramble's cube net.
 - Two rcube instances sharing one solves file overwrite each other's changes
   (last writer wins); run only one at a time per file.

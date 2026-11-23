@@ -3,16 +3,19 @@
 //! Screen layout (main area above the one-line footer):
 //!
 //! ```text
-//!                 scramble text (centred)
+//!                 scramble text (centred, padded)
 //!                       big timer
-//!  .- results ---.   badge / ao5 ... / info   .- scramble -.
-//!  | last 5 solves |                          |  cube net   |
-//!  '--------------'                          '------------'
+//!  .- results ---.   badge / statistics (centred)   .- scramble -.
+//!  | last 5 solves |                                |  cube net   |
+//!  '--------------'                                '------------'
 //! ```
 //!
 //! The two panels in the bottom row have the same height: just enough for the
 //! results header plus five solves. Older results are reached by moving the
 //! selection (the list scrolls with it).
+//!
+//! Two pop-up windows can be drawn on top: the key-binding help (`?`) and the
+//! details of the selected solve (`Enter`).
 
 use crate::app::{App, Phase, HOLD_TO_READY, INSPECTION, INSPECTION_DNF};
 use crate::big;
@@ -23,7 +26,7 @@ use crate::store::Penalty;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Clear, Padding, Paragraph, Wrap};
 use ratatui::Frame;
 use std::time::Instant;
 
@@ -35,6 +38,8 @@ const DIM: Color = Color::DarkGray;
 /// Rows of the scramble text above the timer (one blank, then the moves; the
 /// moves wrap onto the blank row's neighbour on narrow windows).
 const SCRAMBLE_H: u16 = 3;
+/// Columns kept free on each side of the scramble text.
+const SCRAMBLE_PAD: u16 = 4;
 /// Solves visible in the results panel at once.
 const VISIBLE_SOLVES: u16 = 5;
 /// Height of both bottom panels: borders (2) + header (1) + visible solves.
@@ -52,16 +57,21 @@ const MIN_TIMER_H: u16 = 7;
 /// (the statistics line in the middle needs about 57 columns).
 const SHOW_RESULTS_MIN_W: u16 = 75;
 const SHOW_NET_MIN_W: u16 = 104;
+/// Columns the statistics line needs.
+const STATS_W: u16 = 57;
 /// Width of the help window.
 const HELP_W: u16 = 70;
+/// Width of the solve details window.
+const DETAIL_W: u16 = 60;
 
 /// Rectangles of every part of the main screen.
 struct Parts {
     scramble: Rect,
     timer: Rect,
     results: Option<Rect>,
-    /// Between the two panels: badge, statistics, info.
-    middle: Rect,
+    /// Statistics area: centred on the whole screen when there is room,
+    /// otherwise the column between the two bottom panels.
+    center: Rect,
     net: Option<Rect>,
 }
 
@@ -93,7 +103,18 @@ fn layout(main: Rect) -> Parts {
     });
     let middle = cols[i];
     let net = show_net.then(|| cols[i + 1]);
-    Parts { scramble, timer, results, middle, net }
+
+    // Same inset on both sides, so the statistics sit in the screen's centre.
+    let inset = results
+        .map_or(0, |r| r.width)
+        .max(net.map_or(0, |r| r.width));
+    let sym_w = main.width.saturating_sub(2 * inset);
+    let center = if sym_w >= STATS_W {
+        Rect { x: main.x + inset, y: middle.y, width: sym_w, height: middle.height }
+    } else {
+        middle
+    };
+    Parts { scramble, timer, results, center, net }
 }
 
 pub fn draw(f: &mut Frame, app: &App) {
@@ -106,13 +127,15 @@ pub fn draw(f: &mut Frame, app: &App) {
     if let Some(r) = parts.results {
         draw_results(f, app, r);
     }
-    draw_middle(f, app, parts.middle, now);
+    draw_middle(f, app, parts.center, now);
     if let Some(n) = parts.net {
         draw_net(f, app, n);
     }
     draw_footer(f, app, footer);
     if app.show_help {
         draw_help(f, app, f.area());
+    } else if app.show_detail {
+        draw_detail(f, app, f.area());
     }
 }
 
@@ -183,7 +206,7 @@ fn sticker_color(face: Face) -> Color {
     }
 }
 
-/// The scramble moves, centred above the timer.
+/// The scramble moves, centred above the timer with some air on both sides.
 fn draw_scramble_text(f: &mut Frame, app: &App, area: Rect) {
     let lines = vec![
         Line::raw(""),
@@ -193,7 +216,10 @@ fn draw_scramble_text(f: &mut Frame, app: &App, area: Rect) {
         ),
     ];
     f.render_widget(
-        Paragraph::new(lines).alignment(Alignment::Center).wrap(Wrap { trim: true }),
+        Paragraph::new(lines)
+            .block(Block::default().padding(Padding::horizontal(SCRAMBLE_PAD)))
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true }),
         area,
     );
 }
@@ -312,13 +338,12 @@ fn draw_timer(f: &mut Frame, app: &App, timer: Rect, now: Instant) {
     f.render_widget(Paragraph::new(big_lines).alignment(Alignment::Center), rect);
 }
 
-/// Badge / hint line, statistics and the selected solve's details, between the
-/// two bottom panels (statistics and details hidden while solving).
+/// Badge / hint line and statistics, centred under the timer (statistics
+/// hidden while solving).
 fn draw_middle(f: &mut Frame, app: &App, area: Rect, now: Instant) {
-    let [badge, stats_area, info, _] = Layout::vertical([
+    let [badge, stats_area, _] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(2),
-        Constraint::Length(3),
         Constraint::Min(0),
     ])
     .areas(area);
@@ -333,12 +358,6 @@ fn draw_middle(f: &mut Frame, app: &App, area: Rect, now: Instant) {
         f.render_widget(
             Paragraph::new(stats_lines(app)).alignment(Alignment::Center),
             stats_area,
-        );
-        f.render_widget(
-            Paragraph::new(info_lines(app))
-                .alignment(Alignment::Center)
-                .wrap(Wrap { trim: true }),
-            info,
         );
     }
 }
@@ -418,22 +437,6 @@ fn stats_lines(app: &App) -> Vec<Line<'static>> {
     ]
 }
 
-fn info_lines(app: &App) -> Vec<Line<'static>> {
-    let dim = Style::default().fg(DIM);
-    let Some(s) = app.selected_solve() else {
-        return vec![Line::styled("no solves yet - press space to start", dim)];
-    };
-    let raw = match s.penalty {
-        Penalty::None => fmt_cs(s.raw_cs()),
-        Penalty::Plus2 => format!("{} +2", fmt_cs(s.raw_cs())),
-        Penalty::Dnf => format!("DNF ({})", fmt_cs(s.raw_cs())),
-    };
-    vec![
-        Line::from(""),
-        Line::styled(format!("#{}  {}   {}", app.selected + 1, raw, s.scramble), dim),
-    ]
-}
-
 // ---------------------------------------------------------------------- footer
 
 /// The key bindings live in the help window; the footer only says where.
@@ -474,6 +477,7 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
     v.push(heading("Results"));
     v.push(row("h j k l / arrows", "select: j l = older, k h = newer"));
     v.push(row("g / G, Home / End", "newest / oldest result"));
+    v.push(row("Enter", "show details of the selected result"));
     v.push(row("2", "toggle +2 on the selected result"));
     v.push(row("d", "toggle DNF on the selected result"));
     v.push(row("Delete, x", "delete the selected result"));
@@ -544,6 +548,138 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
     let scroll = app.help_scroll.get().min(max_scroll);
     app.help_scroll.set(scroll);
     f.render_widget(Paragraph::new(lines).scroll((scroll, 0)), inner);
+}
+
+// ---------------------------------------------------------------------- detail
+
+/// Greedy word wrap; words longer than `width` stay on a line of their own.
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for word in text.split_whitespace() {
+        if !cur.is_empty() && cur.chars().count() + 1 + word.chars().count() > width {
+            out.push(std::mem::take(&mut cur));
+        }
+        if !cur.is_empty() {
+            cur.push(' ');
+        }
+        cur.push_str(word);
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Unix milliseconds as `YYYY-MM-DD HH:MM:SS UTC` (no date library needed).
+fn fmt_timestamp(ms: u64) -> String {
+    let secs = (ms / 1000) as i64;
+    let days = secs.div_euclid(86_400);
+    let sod = secs.rem_euclid(86_400);
+
+    // civil-from-days (proleptic Gregorian calendar)
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02} UTC",
+        sod / 3600,
+        (sod % 3600) / 60,
+        sod % 60
+    )
+}
+
+/// Everything about the selected solve. `text_w` is the width available for
+/// the scramble, which is wrapped by hand so the window height is exact.
+fn detail_lines(app: &App, text_w: usize) -> Vec<Line<'static>> {
+    let Some(s) = app.selected_solve() else {
+        return Vec::new();
+    };
+    let sel = app.selected;
+    let dim = Style::default().fg(DIM);
+    let green = Style::default().fg(GREEN).add_modifier(Modifier::BOLD);
+    let label = |l: &str| Span::styled(format!(" {l:<10}"), dim);
+
+    let time_style = if s.penalty == Penalty::Dnf {
+        Style::default().fg(RED)
+    } else if app.stats.best_single == Some(sel) {
+        Style::default().fg(GREEN)
+    } else {
+        Style::default()
+    }
+    .add_modifier(Modifier::BOLD);
+    let penalty = match s.penalty {
+        Penalty::None => "none",
+        Penalty::Plus2 => "+2 (2.00 s added)",
+        Penalty::Dnf => "DNF",
+    };
+    let ao5 = app.stats.ao5.get(sel).copied().flatten();
+    let ao12 = stats::ao(&app.solves, sel, 12);
+    let ao100 = stats::ao(&app.solves, sel, 100);
+
+    let mut v: Vec<Line<'static>> = vec![
+        Line::from(vec![label("time"), Span::styled(fmt_solve(s), time_style)]),
+        Line::from(vec![label("raw"), Span::raw(fmt_cs(s.raw_cs()))]),
+        Line::from(vec![label("penalty"), Span::raw(penalty)]),
+    ];
+    if app.stats.best_single == Some(sel) && app.solves.len() > 1 {
+        v.push(Line::from(vec![label(""), Span::styled("★ best single", green)]));
+    }
+    if app.stats.best_ao5 == Some(sel) {
+        v.push(Line::from(vec![label(""), Span::styled("★ best ao5", green)]));
+    }
+
+    v.push(Line::raw(""));
+    v.push(Line::from(vec![label("ao5"), Span::raw(fmt_avg(ao5))]));
+    v.push(Line::from(vec![label("ao12"), Span::raw(fmt_avg(ao12))]));
+    v.push(Line::from(vec![label("ao100"), Span::raw(fmt_avg(ao100))]));
+
+    v.push(Line::raw(""));
+    v.push(Line::from(vec![label("solved"), Span::raw(fmt_timestamp(s.timestamp))]));
+
+    v.push(Line::raw(""));
+    v.push(Line::styled(" scramble", dim));
+    for l in wrap_words(&s.scramble, text_w) {
+        v.push(Line::from(vec![Span::raw(format!(" {l}"))]));
+    }
+    v
+}
+
+/// Centered pop-up with the details of the selected solve.
+fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
+    if app.selected_solve().is_none() {
+        return;
+    }
+    let w = DETAIL_W.min(area.width);
+    if w < 3 {
+        return;
+    }
+    let lines = detail_lines(app, (w as usize).saturating_sub(4));
+    let h = (lines.len() as u16 + 2).min(area.height);
+    if h < 3 {
+        return;
+    }
+    let rect = Rect {
+        x: area.x + (area.width - w) / 2,
+        y: area.y + (area.height - h) / 2,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, rect);
+    let block = Block::bordered()
+        .title(format!(" solve #{} ", app.selected + 1))
+        .title_bottom(" enter / esc close   j k browse ")
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 #[cfg(test)]
@@ -617,6 +753,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn detail_renders_at_many_sizes_without_panicking() {
+        for n in [0, 1, 6, 120] {
+            for (w, h) in SIZES {
+                let mut app = App::new(Store::memory(), solves(n), true, true);
+                app.show_detail = true;
+                let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+                t.draw(|f| draw(f, &app)).unwrap();
+                app.selected = 0;
+                t.draw(|f| draw(f, &app)).unwrap();
+            }
+        }
+    }
+
     fn screen(app: &App, w: u16, h: u16) -> String {
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
         t.draw(|f| draw(f, app)).unwrap();
@@ -644,10 +794,62 @@ mod tests {
             "toggle DNF",
             "undo the last delete",
             "hold and tap mode",
+            "show details",
             "quit",
         ] {
             assert!(help.contains(shown), "{shown:?} missing from help");
         }
+    }
+
+    #[test]
+    fn detail_window_shows_the_highlighted_solve() {
+        let mut app = App::new(Store::memory(), solves(12), true, true);
+        app.selected = 3; // i % 7 == 3: a +2
+        app.solves[3].scramble = "UNIQUEMARK R U F2 D'".into();
+
+        // closed: nothing of it on the main screen
+        let closed = screen(&app, 120, 40);
+        assert!(!closed.contains("UNIQUEMARK") && !closed.contains("penalty"));
+
+        app.show_detail = true;
+        let open = screen(&app, 120, 40);
+        for shown in ["solve #4", "time", "raw", "penalty", "+2 (2.00 s added)", "ao5", "ao12", "ao100", "solved", "UNIQUEMARK R U F2 D'"] {
+            assert!(open.contains(shown), "{shown:?} missing from the detail window");
+        }
+
+        // it follows the selection
+        app.selected = 0;
+        let other = screen(&app, 120, 40);
+        assert!(other.contains("solve #1"));
+        assert!(!other.contains("UNIQUEMARK"));
+    }
+
+    #[test]
+    fn detail_window_is_centred_and_fits_its_content() {
+        let mut app = App::new(Store::memory(), solves(3), true, true);
+        app.show_detail = true;
+        let text = screen(&app, 120, 40);
+        let rows: Vec<&str> = text.lines().collect();
+        let top = rows.iter().position(|r| r.contains("solve #3")).unwrap();
+        let bottom = rows.iter().position(|r| r.contains("enter / esc close")).unwrap();
+        assert_eq!(bottom - top + 1, detail_lines(&app, 56).len() + 2);
+        let above = top;
+        let below = rows.len() - 1 - bottom;
+        assert!(above.abs_diff(below) <= 1, "not vertically centred ({above} vs {below})");
+    }
+
+    #[test]
+    fn wrapping_and_timestamps() {
+        assert_eq!(wrap_words("R U R' U'", 100), vec!["R U R' U'"]);
+        assert_eq!(wrap_words("R U R' U'", 5), vec!["R U", "R' U'"]);
+        assert!(wrap_words("", 10).is_empty());
+        assert_eq!(wrap_words("LONGWORD x", 3), vec!["LONGWORD", "x"]);
+
+        assert_eq!(fmt_timestamp(0), "1970-01-01 00:00:00 UTC");
+        assert_eq!(fmt_timestamp(86_400_000), "1970-01-02 00:00:00 UTC");
+        assert_eq!(fmt_timestamp(1_732_100_000_000), "2024-11-20 10:53:20 UTC");
+        // leap day
+        assert_eq!(fmt_timestamp(1_709_164_800_000), "2024-02-29 00:00:00 UTC");
     }
 
     #[test]
@@ -662,7 +864,7 @@ mod tests {
                         && r.right() <= main.right()
                         && r.bottom() <= main.bottom()
                 };
-                for r in [Some(p.scramble), Some(p.timer), p.results, Some(p.middle), p.net]
+                for r in [Some(p.scramble), Some(p.timer), p.results, Some(p.center), p.net]
                     .into_iter()
                     .flatten()
                 {
@@ -686,6 +888,32 @@ mod tests {
                 assert!(p.scramble.bottom() <= p.timer.y || p.timer.height == 0);
             }
         }
+    }
+
+    #[test]
+    fn stats_area_is_centred_on_the_screen_when_it_fits() {
+        for w in [120u16, 150, 250] {
+            let main = Rect { x: 0, y: 0, width: w, height: 40 };
+            let p = layout(main);
+            assert!(p.center.width >= STATS_W, "{w}");
+            let left = p.center.x - main.x;
+            let right = main.right() - p.center.right();
+            assert_eq!(left, right, "{w}: stats not centred");
+        }
+        // too narrow for a centred line: falls back to the column between the panels
+        let main = Rect { x: 0, y: 0, width: 104, height: 40 };
+        let p = layout(main);
+        assert_eq!(p.center.x, RESULTS_W);
+        assert_eq!(p.center.width, 104 - RESULTS_W - NET_W);
+    }
+
+    #[test]
+    fn selected_solve_info_is_not_drawn_on_the_main_screen() {
+        let mut app = App::new(Store::memory(), vec![], true, true);
+        app.solves = vec![Solve::new(9_876, Penalty::None, "UNIQUESCRAMBLEMARK".into())];
+        app.selected = 0;
+        let text = screen(&app, 140, 40);
+        assert!(!text.contains("UNIQUESCRAMBLEMARK"));
     }
 
     #[test]
@@ -735,6 +963,20 @@ mod tests {
             let left = row.len() - row.trim_start().len();
             let right = row.chars().count() - row.trim_end().chars().count();
             assert!(left.abs_diff(right) <= 1, "{w}: not centred ({left} vs {right})");
+        }
+    }
+
+    #[test]
+    fn scramble_text_keeps_clear_of_the_screen_edge() {
+        let app = App::new(Store::memory(), solves(3), true, true);
+        // narrow enough that the scramble has to wrap
+        let w = 40u16;
+        let text = screen(&app, w, 40);
+        for row in text.lines().take(SCRAMBLE_H as usize) {
+            let chars: Vec<char> = row.chars().collect();
+            let pad = SCRAMBLE_PAD as usize;
+            assert!(chars.iter().take(pad).all(|c| *c == ' '), "left edge: {row:?}");
+            assert!(chars.iter().rev().take(pad).all(|c| *c == ' '), "right edge: {row:?}");
         }
     }
 
